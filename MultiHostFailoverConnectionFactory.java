@@ -14,11 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
- * Solace Multi-Host ConnectionFactory:
- * - Retries 5x before switching to secondary
- * - Logs and alerts failures
- * - Updates Micrometer metrics
- * - Compatible with Camel JMS
+ * Solace multi-host ConnectionFactory with runtime retry + automatic failover.
  */
 public class MultiHostFailoverConnectionFactory implements ConnectionFactory {
 
@@ -30,7 +26,6 @@ public class MultiHostFailoverConnectionFactory implements ConnectionFactory {
     private final String password;
     private final int retryLimit;
     private final long retryDelayMs;
-
     private final SolaceConnectionMetrics metrics;
     private final AlertNotifier notifier;
     private final CachingConnectionFactory cachingFactory;
@@ -60,126 +55,123 @@ public class MultiHostFailoverConnectionFactory implements ConnectionFactory {
         this.retryDelayMs = retryDelayMs;
 
         if (hosts.isEmpty()) {
-            throw new IllegalStateException("No Solace hosts configured!");
+            throw new IllegalArgumentException("No Solace hosts configured!");
         }
     }
 
     private static List<String> parseHosts(String csv) {
         return Arrays.stream(csv.split("\\s*,\\s*"))
-                .filter(s -> !s.isBlank())
+                .filter(h -> !h.isBlank())
                 .distinct()
                 .collect(Collectors.toList());
     }
 
     // ---------------------------------------------------------------------
-    // JMS 1.1 API
+    // JMS 1.1
     // ---------------------------------------------------------------------
+    @Override public Connection createConnection() { return createConnection(username, password); }
 
     @Override
-    public Connection createConnection() {
-        return createConnection(username, password);
-    }
-
-    @Override
-    public Connection createConnection(String username, String password) {
-        int startingIndex = activeIndex.get() >= 0 ? activeIndex.get() : 0;
-
+    public Connection createConnection(String user, String pass) {
+        int start = (activeIndex.get() >= 0) ? activeIndex.get() : 0;
         for (int i = 0; i < hosts.size(); i++) {
-            int hostIndex = (startingIndex + i) % hosts.size();
-            String host = hosts.get(hostIndex);
+            int idx = (start + i) % hosts.size();
+            String host = hosts.get(idx);
 
-            boolean connected = false;
             for (int attempt = 1; attempt <= retryLimit; attempt++) {
                 try {
+                    log.info("🔌 Trying Solace host [{}] (attempt {}/{})", host, attempt, retryLimit);
                     SolConnectionFactory f = SolJmsUtility.createConnectionFactory();
                     f.setHost(host);
                     f.setVPN(vpn);
-                    f.setUsername(username);
-                    f.setPassword(password);
+                    f.setUsername(user);
+                    f.setPassword(pass);
                     f.setReconnectRetries(0);
 
-                    Connection c = f.createConnection();
-                    activeIndex.set(hostIndex);
+                    Connection conn = f.createConnection();
+                    conn.setExceptionListener(new SolaceConnectionListener(this, host, metrics, notifier));
+                    activeIndex.set(idx);
                     failureCount.set(0);
-                    metrics.markUp();
-                    log.info("✅ Connected to Solace host: {} (VPN={})", host, vpn);
-                    return c;
-                } catch (Exception e) {
-                    metrics.markDown();
-                    metrics.incFailure();
-                    log.warn("❌ [Host={}] Connection attempt {}/{} failed: {}", host, attempt, retryLimit, e.getMessage());
+                    metrics.markUp(host);
+                    log.info("✅ Connected to Solace host={} vpn={}", host, vpn);
+                    return conn;
 
+                } catch (Exception e) {
+                    metrics.markDown(host);
+                    metrics.incFailure(host);
+                    log.warn("❌ Attempt {}/{} failed for host {}: {}", attempt, retryLimit, host, e.getMessage());
                     try { Thread.sleep(retryDelayMs); } catch (InterruptedException ignored) {}
                 }
             }
 
-            // all retries failed for current host
-            notifier.notify("Solace connection failed after " + retryLimit + " retries on host " + host);
-            log.error("🚨 All {} retry attempts failed for Solace host: {}", retryLimit, host);
-
-            // switch to next host automatically
-            if (i < hosts.size() - 1) {
-                log.warn("🔁 Switching to secondary host: {}", hosts.get((hostIndex + 1) % hosts.size()));
-            }
+            log.error("🚨 All {} retries failed for host {}, switching.", retryLimit, host);
+            notifier.notify("Solace host failed: " + host);
+            switchToNextHost();
         }
-
-        throw new RuntimeException("❌ All Solace hosts failed to connect: " + hosts);
+        throw new RuntimeException("All Solace hosts failed: " + hosts);
     }
 
     // ---------------------------------------------------------------------
     // JMS 2.0 Context
     // ---------------------------------------------------------------------
+    @Override public JMSContext createContext() { return createContext(username, password); }
+    @Override public JMSContext createContext(String u, String p) { return createContext(u, p, Session.AUTO_ACKNOWLEDGE); }
     @Override
-    public JMSContext createContext() {
-        return createContext(username, password);
-    }
-
-    @Override
-    public JMSContext createContext(String username, String password) {
-        Connection c = createConnection(username, password);
+    public JMSContext createContext(String u, String p, int mode) {
+        Connection c = createConnection(u, p);
         try {
-            return c.createSession(Session.AUTO_ACKNOWLEDGE).getJMSContext();
-        } catch (JMSException e) {
-            throw new RuntimeException("Failed to create JMSContext", e);
-        }
-    }
-
-    @Override
-    public JMSContext createContext(String username, String password, int sessionMode) {
-        Connection c = createConnection(username, password);
-        try {
-            return c.createSession(sessionMode).getJMSContext();
-        } catch (JMSException e) {
+            Session s = c.createSession(mode);
+            return s.getJMSContext();
+        } catch (Exception e) {
             throw new RuntimeException("Failed to create JMSContext", e);
         }
     }
 
     // ---------------------------------------------------------------------
-    // Failover Handling
+    // Runtime Retry & Failover
     // ---------------------------------------------------------------------
-    public void handleListenerFailure(Exception ex) {
-        int failures = failureCount.incrementAndGet();
-        metrics.markDown();
-        log.warn("⚠️ Listener failure detected: {}", ex.getMessage());
-        if (failures >= retryLimit) {
-            notifier.notify("Listener repeated failure detected for host " + getActiveHost());
-            switchToNextHost();
+    public synchronized void retryAndRecover(String failingHost) {
+        log.warn("⚠️ Connection lost for {} — retrying...", failingHost);
+        for (int attempt = 1; attempt <= retryLimit; attempt++) {
+            try {
+                log.info("🔁 Reconnect attempt {}/{} for {}", attempt, retryLimit, failingHost);
+                SolConnectionFactory f = SolJmsUtility.createConnectionFactory();
+                f.setHost(failingHost);
+                f.setVPN(vpn);
+                f.setUsername(username);
+                f.setPassword(password);
+                f.setReconnectRetries(0);
+
+                try (Connection conn = f.createConnection()) {
+                    metrics.markUp(failingHost);
+                    failureCount.set(0);
+                    log.info("✅ Reconnected to {}", failingHost);
+                    return;
+                }
+
+            } catch (Exception e) {
+                metrics.markDown(failingHost);
+                metrics.incFailure(failingHost);
+                log.warn("❌ Retry {}/{} failed for {}: {}", attempt, retryLimit, failingHost, e.getMessage());
+                try { Thread.sleep(retryDelayMs); } catch (InterruptedException ignored) {}
+            }
         }
+
+        log.error("🚨 All retries failed for {} — switching host.", failingHost);
+        notifier.notify("Connection recovery failed for host " + failingHost);
+        switchToNextHost();
     }
 
-    private synchronized void switchToNextHost() {
+    public synchronized void switchToNextHost() {
         int current = activeIndex.get();
         int next = (current + 1) % hosts.size();
         if (next == current) return;
         log.warn("🔄 Switching Solace host {} → {}", hosts.get(current), hosts.get(next));
         activeIndex.set(next);
         failureCount.set(0);
-        cachingFactory.resetConnection();
+        cachingFactory.resetConnection();   // causes Camel/Spring DMLC to reconnect
     }
 
-    // ---------------------------------------------------------------------
-    // Accessors
-    // ---------------------------------------------------------------------
     public String getActiveHost() {
         int idx = activeIndex.get();
         return (idx >= 0 && idx < hosts.size()) ? hosts.get(idx) : "none";
