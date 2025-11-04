@@ -1,25 +1,43 @@
 
-import java.io.*;
-import java.nio.file.*;
+import com.example.config.RaftConfig;
+import java.net.InetAddress;
 import java.util.*;
+import java.util.concurrent.ConcurrentSkipListSet;
 
+/**
+ * Dynamic in-memory RAFT member registry.
+ * Keeps membership synchronized across leader/followers via RAFT log or heartbeats.
+ */
 public class DynamicRaftRegistry {
 
-    private static final Path REGISTRY_FILE = Path.of("/tmp/raft-members.txt");
+    private static final Set<String> activeMembers = new ConcurrentSkipListSet<>();
 
-    public static synchronized List<String> registerAndGetMembers(String hostname, int port) throws IOException {
-        List<String> members = new ArrayList<>();
-        if (Files.exists(REGISTRY_FILE)) {
-            members = Files.readAllLines(REGISTRY_FILE);
-        }
+    /** Called at startup to merge configured and local entries. */
+    public static synchronized List<String> registerAndGetMembers(RaftConfig cfg, int actualPort) {
+        String self = cfg.getBindAddress() + "[" + actualPort + "]";
+        if (cfg.getMembers() != null) activeMembers.addAll(cfg.getMembers());
+        activeMembers.add(self);
+        System.out.printf("📋 Current RAFT members: %s%n", activeMembers);
+        return new ArrayList<>(activeMembers);
+    }
 
-        String self = hostname + "[" + port + "]";
-        if (!members.contains(self)) {
-            members.add(self);
-            Files.write(REGISTRY_FILE, members);
-        }
+    /** Called when leader or heartbeat propagates updated membership list. */
+    public static synchronized void updateFromLeader(Collection<String> latestMembers) {
+        activeMembers.addAll(latestMembers);
+        System.out.printf("🔁 Registry synced from leader: %s%n", activeMembers);
+    }
 
-        System.out.printf("📋 Dynamic registry updated: %s%n", members);
-        return members;
+    /** Returns the active members in this node’s view. */
+    public static List<String> getActiveMembers() {
+        return new ArrayList<>(activeMembers);
+    }
+
+    /** Ensure hostname is resolved properly if bind-address is localhost. */
+    public static void resolveHostname(RaftConfig cfg) {
+        try {
+            if ("localhost".equals(cfg.getBindAddress()) || cfg.getBindAddress() == null) {
+                cfg.setBindAddress(InetAddress.getLocalHost().getHostName());
+            }
+        } catch (Exception ignored) {}
     }
 }
