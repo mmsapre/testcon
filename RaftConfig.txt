@@ -1,0 +1,11 @@
+@ConfigurationProperties(prefix = "dds.stats.raft")
+public class RaftConfig {
+    private String clusterName = "dds-stats-cluster";
+    private String bindAddress = "localhost";
+    private int bindPort = 0; // random
+    private String discovery = "auto"; // auto | tcp | dns | kube
+    private String serviceName = "dds-stats";
+    private List<String> members = List.of();
+
+    // getters and setters...
+}
