@@ -1,0 +1,5 @@
+dds:
+  stats:
+    raft:
+      discovery: "auto"  # automatically detects via env
+      service-name: "dds-stats"
