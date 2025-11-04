@@ -61,39 +61,26 @@ public class ReplicatedDdsStatsCache implements StateMachine {
         this.raft = new RaftHandle(channel, this).raftId(channel.getName());
         channel.connect(cfg.getClusterName());
 
-        // Listen for leader election and rebroadcast membership
-      try {
-    // Modern versions
-    raft.getClass().getMethod("addRoleListener", RaftHandle.RoleChangeListener.class)
-        .invoke(raft, (RaftHandle.RoleChangeListener) (oldRole, newRole) -> {
-            System.out.printf("👑 RAFT role change: %s → %s%n", oldRole, newRole);
-            if (raft.isLeader()) {
+     final boolean[] lastLeaderState = { raft.isLeader() };
+
+Timer leaderWatchdog = new Timer("dds-stats-leader-watch", true);
+leaderWatchdog.scheduleAtFixedRate(new TimerTask() {
+    @Override
+    public void run() {
+        boolean currentLeader = raft.isLeader();
+        if (currentLeader != lastLeaderState[0]) {
+            System.out.printf("👑 RAFT leader state changed → %s%n", currentLeader ? "LEADER" : "FOLLOWER");
+            lastLeaderState[0] = currentLeader;
+            if (currentLeader) {
                 try {
                     replicateMembershipUpdate(DynamicRaftRegistry.getActiveMembers());
                 } catch (Exception e) {
                     System.err.println("⚠️ Membership replication failed: " + e.getMessage());
                 }
             }
-        });
-} catch (NoSuchMethodException e1) {
-    // Fallback for older versions (addRoleChangeListener)
-    try {
-        raft.getClass().getMethod("addRoleChangeListener", RaftHandle.RoleChangeListener.class)
-            .invoke(raft, (RaftHandle.RoleChangeListener) (oldRole, newRole) -> {
-                System.out.printf("👑 RAFT role change: %s → %s%n", oldRole, newRole);
-                if (raft.isLeader()) {
-                    try {
-                        replicateMembershipUpdate(DynamicRaftRegistry.getActiveMembers());
-                    } catch (Exception ex) {
-                        System.err.println("⚠️ Membership replication failed: " + ex.getMessage());
-                    }
-                }
-            });
-    } catch (Exception inner) {
-        throw new RuntimeException("❌ No suitable role listener method found in RaftHandle", inner);
+        }
     }
-}
-
+}, 5000, 5000);
 
         // Heartbeat broadcaster (leader only)
         heartbeatTimer.scheduleAtFixedRate(new TimerTask() {
