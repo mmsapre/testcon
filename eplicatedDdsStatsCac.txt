@@ -1,0 +1,189 @@
+
+import com.example.config.RaftConfig;
+import org.jgroups.JChannel;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.dns.DNS_PING;
+import org.jgroups.protocols.kubernetes.KUBE_PING;
+import org.jgroups.raft.RaftHandle;
+import org.jgroups.raft.StateMachine;
+import org.jgroups.stack.ProtocolStack;
+
+import java.io.*;
+import java.net.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * RAFT-replicated stats cache that automatically adapts to environment:
+ * - K8s: KUBE_PING or DNS_PING
+ * - Nomad or VM: dynamic TCPPING registry with random ports
+ */
+public class ReplicatedDdsStatsCache implements StateMachine {
+
+    private final DdsStatsCache localCache;
+    private final RaftHandle raft;
+    private final JChannel channel;
+    private final Timer reconcileTimer = new Timer("dds-stats-sync", true);
+
+    public ReplicatedDdsStatsCache(RaftConfig cfg, DdsStatsCache localCache) throws Exception {
+        this.localCache = localCache;
+
+        InetAddress bindAddr = InetAddress.getByName(cfg.getBindAddress());
+        int port = cfg.getBindPort() == 0 ? getFreePort() : cfg.getBindPort();
+
+        // --- Channel setup ---
+        this.channel = new JChannel(false);
+        ProtocolStack stack = new ProtocolStack();
+        stack.setChannel(channel);
+
+        stack.addProtocol(new TCP().setBindAddress(bindAddr).setBindPort(port));
+        addDiscoveryProtocol(stack, cfg, port);
+
+        stack.addProtocol(new MERGE3())
+             .addProtocol(new FD_SOCK())
+             .addProtocol(new FD_ALL())
+             .addProtocol(new VERIFY_SUSPECT())
+             .addProtocol(new BARRIER())
+             .addProtocol(new NAKACK2())
+             .addProtocol(new UNICAST3())
+             .addProtocol(new STABLE())
+             .addProtocol(new GMS())
+             .addProtocol(new UFC())
+             .addProtocol(new MFC())
+             .addProtocol(new FRAG2())
+             .addProtocol(new org.jgroups.raft.protocols.RAFT())
+             .init();
+
+        channel.setName(UUID.randomUUID().toString());
+        this.raft = new RaftHandle(channel, this).raftId(channel.getName());
+        channel.connect(cfg.getClusterName());
+
+        System.out.printf("✅ Node [%s] started on %s:%d (cluster=%s)%n",
+                channel.getName(), cfg.getBindAddress(), port, cfg.getClusterName());
+
+        reconcileTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                System.out.printf("🔄 Node [%s] leader=%s cacheSize=%d%n",
+                        channel.getName(), raft.isLeader(), localCache.asMap().size());
+            }
+        }, 15000, 30000);
+    }
+
+    // --- State machine replication ---
+    @Override
+    public byte[] apply(byte[] data, int offset, int length, boolean serializeResponse) {
+        try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
+            String key = dis.readUTF();
+            double val = dis.readDouble();
+            localCache.onReplicatedUpdate(key, val);
+            System.out.printf("📣 [%s] Applied replicated metric: %s=%f%n", channel.getName(), key, val);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    @Override public void readContentFrom(DataInput in) {}
+    @Override public void writeContentTo(DataOutput out) {}
+
+    // --- Leader Operations ---
+    public void put(String key, double value) throws Exception {
+        localCache.put(key, value);
+        replicate(key, value);
+    }
+
+    private void replicate(String key, double value) throws Exception {
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream();
+             DataOutputStream dos = new DataOutputStream(out)) {
+            dos.writeUTF(key);
+            dos.writeDouble(value);
+            byte[] payload = out.toByteArray();
+            raft.setAsync(payload, 0, payload.length)
+                .exceptionally(ex -> { ex.printStackTrace(); return null; });
+        }
+    }
+
+    public boolean isLeader() { return raft.isLeader(); }
+
+    public void shutdown() {
+        reconcileTimer.cancel();
+        channel.close();
+        System.out.println("🛑 RAFT node stopped");
+    }
+
+    // --- Environment auto-detection ---
+    private void addDiscoveryProtocol(ProtocolStack stack, RaftConfig cfg, int port) {
+        String discovery = Optional.ofNullable(cfg.getDiscovery()).orElse("auto").toLowerCase();
+
+        try {
+            switch (discovery) {
+                case "kube" -> {
+                    stack.addProtocol(new KUBE_PING().setLabel("app", cfg.getServiceName()));
+                    System.out.printf("🌐 Using KUBE_PING for Kubernetes discovery (label=app=%s)%n", cfg.getServiceName());
+                }
+                case "dns" -> {
+                    stack.addProtocol(new DNS_PING().setDnsServiceName(cfg.getServiceName()).setTimeout(3000));
+                    System.out.printf("🌐 Using DNS_PING discovery for service: %s%n", cfg.getServiceName());
+                }
+                case "tcp" -> {
+                    configureDynamicTCPPing(stack, cfg, port);
+                    System.out.println("📡 Using TCPPING for static/dynamic VM discovery");
+                }
+                default -> {  // auto
+                    if (isKubernetes()) {
+                        stack.addProtocol(new KUBE_PING().setLabel("app", cfg.getServiceName()));
+                        System.out.println("🤖 Auto: Detected K8s → KUBE_PING enabled");
+                    } else if (Files.exists(Path.of("/nomad"))) {
+                        stack.addProtocol(new DNS_PING().setDnsServiceName(cfg.getServiceName()));
+                        System.out.println("🤖 Auto: Detected Nomad → DNS_PING enabled");
+                    } else {
+                        configureDynamicTCPPing(stack, cfg, port);
+                        System.out.println("🤖 Auto: Detected VM → dynamic TCPPING enabled");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("❌ Discovery configuration failed: " + e.getMessage(), e);
+        }
+    }
+
+    private void configureDynamicTCPPing(ProtocolStack stack, RaftConfig cfg, int port) throws IOException {
+        List<String> members = DynamicRaftRegistry.registerAndGetMembers(cfg.getBindAddress(), port);
+        List<InetSocketAddress> hosts = members.stream()
+                .map(ReplicatedDdsStatsCache::parseInetSocketAddress)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        stack.addProtocol(new TCPPING().setInitialHosts(hosts));
+    }
+
+    private static boolean isKubernetes() {
+        return System.getenv("KUBERNETES_SERVICE_HOST") != null;
+    }
+
+    private static InetSocketAddress parseInetSocketAddress(String spec) {
+        try {
+            int start = spec.indexOf('[');
+            int end = spec.indexOf(']');
+            String host = (start > 0 && end > start) ? spec.substring(0, start) : spec;
+            String portStr = (start > 0 && end > start) ? spec.substring(start + 1, end) : "0";
+            int port = portStr.isBlank() ? 0 : Integer.parseInt(portStr);
+            InetAddress addr = InetAddress.getByName(host);
+            return new InetSocketAddress(addr, port);
+        } catch (Exception e) {
+            System.err.println("⚠️ Invalid host entry: " + spec + " (" + e.getMessage() + ")");
+            return null;
+        }
+    }
+
+    private static int getFreePort() {
+        try (ServerSocket s = new ServerSocket(0)) {
+            s.setReuseAddress(true);
+            return s.getLocalPort();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
