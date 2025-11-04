@@ -1,0 +1,9 @@
+dds:
+  stats:
+    enable: true
+    raft:
+      cluster-name: "dds-stats-cluster"
+      bind-address: "${HOSTNAME:localhost}"
+      bind-port: 0
+      discovery: "auto"
+      service-name: "dds-stats"
