@@ -11,14 +11,15 @@ import org.jgroups.stack.ProtocolStack;
 
 import java.io.*;
 import java.net.*;
-import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * RAFT-replicated stats cache that automatically adapts to environment:
- * - K8s: KUBE_PING or DNS_PING
- * - Nomad or VM: dynamic TCPPING registry with random ports
+ * Unified RAFT-replicated DDS stats cache:
+ *  - auto-detects environment (K8s / Nomad / VM)
+ *  - dynamic ports
+ *  - leader aware
+ *  - propagates metrics, membership, and periodic heartbeats
  */
 public class ReplicatedDdsStatsCache implements StateMachine {
 
@@ -26,18 +27,18 @@ public class ReplicatedDdsStatsCache implements StateMachine {
     private final RaftHandle raft;
     private final JChannel channel;
     private final Timer reconcileTimer = new Timer("dds-stats-sync", true);
+    private final Timer heartbeatTimer = new Timer("dds-stats-heartbeat", true);
 
     public ReplicatedDdsStatsCache(RaftConfig cfg, DdsStatsCache localCache) throws Exception {
         this.localCache = localCache;
 
+        DynamicRaftRegistry.resolveHostname(cfg);
         InetAddress bindAddr = InetAddress.getByName(cfg.getBindAddress());
         int port = cfg.getBindPort() == 0 ? getFreePort() : cfg.getBindPort();
 
-        // --- Channel setup ---
         this.channel = new JChannel(false);
         ProtocolStack stack = new ProtocolStack();
         stack.setChannel(channel);
-
         stack.addProtocol(new TCP().setBindAddress(bindAddr).setBindPort(port));
         addDiscoveryProtocol(stack, cfg, port);
 
@@ -60,26 +61,70 @@ public class ReplicatedDdsStatsCache implements StateMachine {
         this.raft = new RaftHandle(channel, this).raftId(channel.getName());
         channel.connect(cfg.getClusterName());
 
+        // Listen for leader election and rebroadcast membership
+        this.raft.addRoleListener((oldRole, newRole) -> {
+            System.out.printf("👑 RAFT role change: %s → %s%n", oldRole, newRole);
+            if (raft.isLeader()) {
+                try {
+                    replicateMembershipUpdate(DynamicRaftRegistry.getActiveMembers());
+                } catch (Exception e) {
+                    System.err.println("⚠️ Membership replication failed: " + e.getMessage());
+                }
+            }
+        });
+
+        // Heartbeat broadcaster (leader only)
+        heartbeatTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                if (raft.isLeader()) {
+                    try {
+                        sendHeartbeat();
+                    } catch (Exception e) {
+                        System.err.println("⚠️ Heartbeat send failed: " + e.getMessage());
+                    }
+                }
+            }
+        }, 10000, 20000); // every 20s
+
         System.out.printf("✅ Node [%s] started on %s:%d (cluster=%s)%n",
                 channel.getName(), cfg.getBindAddress(), port, cfg.getClusterName());
 
         reconcileTimer.scheduleAtFixedRate(new TimerTask() {
-            @Override
-            public void run() {
+            @Override public void run() {
                 System.out.printf("🔄 Node [%s] leader=%s cacheSize=%d%n",
                         channel.getName(), raft.isLeader(), localCache.asMap().size());
             }
         }, 15000, 30000);
     }
 
-    // --- State machine replication ---
+    // ---------------- StateMachine ----------------
     @Override
     public byte[] apply(byte[] data, int offset, int length, boolean serializeResponse) {
         try (DataInputStream dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
             String key = dis.readUTF();
+
+            if ("__members__".equals(key)) {
+                int n = dis.readInt();
+                List<String> members = new ArrayList<>();
+                for (int i = 0; i < n; i++) members.add(dis.readUTF());
+                DynamicRaftRegistry.updateFromLeader(members);
+                return null;
+            }
+
+            if ("__heartbeat__".equals(key)) {
+                String leaderId = dis.readUTF();
+                int n = dis.readInt();
+                List<String> members = new ArrayList<>();
+                for (int i = 0; i < n; i++) members.add(dis.readUTF());
+                DynamicRaftRegistry.updateFromLeader(members);
+                System.out.printf("💓 Heartbeat received from [%s], members now: %s%n", leaderId, members);
+                return null;
+            }
+
             double val = dis.readDouble();
             localCache.onReplicatedUpdate(key, val);
-            System.out.printf("📣 [%s] Applied replicated metric: %s=%f%n", channel.getName(), key, val);
+            System.out.printf("📣 [%s] Replicated metric: %s=%f%n", channel.getName(), key, val);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -89,82 +134,105 @@ public class ReplicatedDdsStatsCache implements StateMachine {
     @Override public void readContentFrom(DataInput in) {}
     @Override public void writeContentTo(DataOutput out) {}
 
-    // --- Leader Operations ---
+    // ---------------- Metric replication ----------------
     public void put(String key, double value) throws Exception {
         localCache.put(key, value);
-        replicate(key, value);
+        replicateMetric(key, value);
     }
 
-    private void replicate(String key, double value) throws Exception {
-        try (ByteArrayOutputStream out = new ByteArrayOutputStream();
-             DataOutputStream dos = new DataOutputStream(out)) {
-            dos.writeUTF(key);
-            dos.writeDouble(value);
-            byte[] payload = out.toByteArray();
-            raft.setAsync(payload, 0, payload.length)
-                .exceptionally(ex -> { ex.printStackTrace(); return null; });
-        }
+    private void replicateMetric(String key, double value) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(out);
+        dos.writeUTF(key);
+        dos.writeDouble(value);
+        byte[] payload = out.toByteArray();
+        raft.setAsync(payload, 0, payload.length)
+            .exceptionally(ex -> { ex.printStackTrace(); return null; });
+    }
+
+    private void replicateMembershipUpdate(List<String> members) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(out);
+        dos.writeUTF("__members__");
+        dos.writeInt(members.size());
+        for (String m : members) dos.writeUTF(m);
+        raft.setAsync(out.toByteArray(), 0, out.size())
+            .exceptionally(ex -> { ex.printStackTrace(); return null; });
+    }
+
+    private void sendHeartbeat() throws Exception {
+        List<String> members = DynamicRaftRegistry.getActiveMembers();
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(out);
+        dos.writeUTF("__heartbeat__");
+        dos.writeUTF(channel.getName());
+        dos.writeInt(members.size());
+        for (String m : members) dos.writeUTF(m);
+        raft.setAsync(out.toByteArray(), 0, out.size())
+            .exceptionally(ex -> { ex.printStackTrace(); return null; });
+        System.out.printf("💓 [%s] Heartbeat sent (members=%d)%n", channel.getName(), members.size());
     }
 
     public boolean isLeader() { return raft.isLeader(); }
 
     public void shutdown() {
         reconcileTimer.cancel();
+        heartbeatTimer.cancel();
         channel.close();
         System.out.println("🛑 RAFT node stopped");
     }
 
-    // --- Environment auto-detection ---
+    // ---------------- Discovery logic ----------------
     private void addDiscoveryProtocol(ProtocolStack stack, RaftConfig cfg, int port) {
-    String discovery = Optional.ofNullable(cfg.getDiscovery()).orElse("auto").toLowerCase();
+        String discovery = Optional.ofNullable(cfg.getDiscovery()).orElse("auto").toLowerCase();
 
-    try {
-        switch (discovery) {
-            case "kube" -> {
-                KUBE_PING kube = new KUBE_PING();
-                kube.setValue("namespace", System.getenv().getOrDefault("KUBERNETES_NAMESPACE", "default"));
-                kube.setValue("label_selector", "app=" + cfg.getServiceName());
-                stack.addProtocol(kube);
-                System.out.printf("🌐 Using KUBE_PING (namespace=default, label=app=%s)%n", cfg.getServiceName());
-            }
-            case "dns" -> {
-                DNS_PING dns = new DNS_PING();
-                dns.setValue("dns_query", cfg.getServiceName() + ".default.svc.cluster.local");
-                dns.setValue("dns_record_type", "A");
-                dns.setTimeout(3000);
-                stack.addProtocol(dns);
-                System.out.printf("🌐 Using DNS_PING (query=%s)%n", cfg.getServiceName());
-            }
-            case "tcp" -> {
-                configureDynamicTCPPing(stack, cfg, port);
-                System.out.println("📡 Using TCPPING (VM/Nomad dynamic)");
-            }
-            default -> {
-                if (isKubernetes()) {
+        try {
+            switch (discovery) {
+                case "kube" -> {
                     KUBE_PING kube = new KUBE_PING();
-                    kube.setValue("namespace", "default");
+                    kube.setValue("namespace", System.getenv().getOrDefault("KUBERNETES_NAMESPACE", "default"));
                     kube.setValue("label_selector", "app=" + cfg.getServiceName());
                     stack.addProtocol(kube);
-                    System.out.println("🤖 Auto-detected K8s → KUBE_PING");
-                } else {
+                    System.out.printf("🌐 Using KUBE_PING (label=app=%s)%n", cfg.getServiceName());
+                }
+                case "dns" -> {
+                    DNS_PING dns = new DNS_PING();
+                    dns.setValue("dns_query", cfg.getServiceName() + ".default.svc.cluster.local");
+                    dns.setValue("dns_record_type", "A");
+                    dns.setValue("timeout", "3000");
+                    stack.addProtocol(dns);
+                    System.out.printf("🌐 Using DNS_PING (query=%s)%n", cfg.getServiceName());
+                }
+                case "tcp" -> {
                     configureDynamicTCPPing(stack, cfg, port);
-                    System.out.println("🤖 Auto-detected VM/Nomad → TCPPING");
+                    System.out.println("📡 Using TCPPING (VM/Nomad dynamic)");
+                }
+                default -> {
+                    if (isKubernetes()) {
+                        KUBE_PING kube = new KUBE_PING();
+                        kube.setValue("namespace", "default");
+                        kube.setValue("label_selector", "app=" + cfg.getServiceName());
+                        stack.addProtocol(kube);
+                        System.out.println("🤖 Auto-detected K8s → KUBE_PING");
+                    } else {
+                        configureDynamicTCPPing(stack, cfg, port);
+                        System.out.println("🤖 Auto-detected VM/Nomad → TCPPING");
+                    }
                 }
             }
+        } catch (Exception e) {
+            throw new RuntimeException("❌ Discovery configuration failed: " + e.getMessage(), e);
         }
-    } catch (Exception e) {
-        throw new RuntimeException("❌ Discovery configuration failed: " + e.getMessage(), e);
     }
-}
 
-
-    private void configureDynamicTCPPing(ProtocolStack stack, RaftConfig cfg, int port) throws IOException {
-        List<String> members = DynamicRaftRegistry.registerAndGetMembers(cfg.getBindAddress(), port);
+    private void configureDynamicTCPPing(ProtocolStack stack, RaftConfig cfg, int port) {
+        List<String> members = DynamicRaftRegistry.registerAndGetMembers(cfg, port);
         List<InetSocketAddress> hosts = members.stream()
                 .map(ReplicatedDdsStatsCache::parseInetSocketAddress)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
         stack.addProtocol(new TCPPING().setInitialHosts(hosts));
+        System.out.printf("📡 Using dynamic TCPPING hosts: %s%n", hosts);
     }
 
     private static boolean isKubernetes() {
@@ -176,8 +244,11 @@ public class ReplicatedDdsStatsCache implements StateMachine {
             int start = spec.indexOf('[');
             int end = spec.indexOf(']');
             String host = (start > 0 && end > start) ? spec.substring(0, start) : spec;
-            String portStr = (start > 0 && end > start) ? spec.substring(start + 1, end) : "0";
-            int port = portStr.isBlank() ? 0 : Integer.parseInt(portStr);
+            int port = 0;
+            if (start > 0 && end > start) {
+                String portStr = spec.substring(start + 1, end);
+                port = portStr.isBlank() ? 0 : Integer.parseInt(portStr);
+            }
             InetAddress addr = InetAddress.getByName(host);
             return new InetSocketAddress(addr, port);
         } catch (Exception e) {
