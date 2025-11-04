@@ -1,0 +1,25 @@
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class DynamicRaftRegistry {
+
+    private static final Path REGISTRY_FILE = Path.of("/tmp/raft-members.txt");
+
+    public static synchronized List<String> registerAndGetMembers(String hostname, int port) throws IOException {
+        List<String> members = new ArrayList<>();
+        if (Files.exists(REGISTRY_FILE)) {
+            members = Files.readAllLines(REGISTRY_FILE);
+        }
+
+        String self = hostname + "[" + port + "]";
+        if (!members.contains(self)) {
+            members.add(self);
+            Files.write(REGISTRY_FILE, members);
+        }
+
+        System.out.printf("📋 Dynamic registry updated: %s%n", members);
+        return members;
+    }
+}
