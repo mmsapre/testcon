@@ -116,39 +116,47 @@ public class ReplicatedDdsStatsCache implements StateMachine {
 
     // --- Environment auto-detection ---
     private void addDiscoveryProtocol(ProtocolStack stack, RaftConfig cfg, int port) {
-        String discovery = Optional.ofNullable(cfg.getDiscovery()).orElse("auto").toLowerCase();
+    String discovery = Optional.ofNullable(cfg.getDiscovery()).orElse("auto").toLowerCase();
 
-        try {
-            switch (discovery) {
-                case "kube" -> {
-                    stack.addProtocol(new KUBE_PING().setLabel("app", cfg.getServiceName()));
-                    System.out.printf("🌐 Using KUBE_PING for Kubernetes discovery (label=app=%s)%n", cfg.getServiceName());
-                }
-                case "dns" -> {
-                    stack.addProtocol(new DNS_PING().setDnsServiceName(cfg.getServiceName()).setTimeout(3000));
-                    System.out.printf("🌐 Using DNS_PING discovery for service: %s%n", cfg.getServiceName());
-                }
-                case "tcp" -> {
+    try {
+        switch (discovery) {
+            case "kube" -> {
+                KUBE_PING kube = new KUBE_PING();
+                kube.setValue("namespace", System.getenv().getOrDefault("KUBERNETES_NAMESPACE", "default"));
+                kube.setValue("label_selector", "app=" + cfg.getServiceName());
+                stack.addProtocol(kube);
+                System.out.printf("🌐 Using KUBE_PING (namespace=default, label=app=%s)%n", cfg.getServiceName());
+            }
+            case "dns" -> {
+                DNS_PING dns = new DNS_PING();
+                dns.setValue("dns_query", cfg.getServiceName() + ".default.svc.cluster.local");
+                dns.setValue("dns_record_type", "A");
+                dns.setTimeout(3000);
+                stack.addProtocol(dns);
+                System.out.printf("🌐 Using DNS_PING (query=%s)%n", cfg.getServiceName());
+            }
+            case "tcp" -> {
+                configureDynamicTCPPing(stack, cfg, port);
+                System.out.println("📡 Using TCPPING (VM/Nomad dynamic)");
+            }
+            default -> {
+                if (isKubernetes()) {
+                    KUBE_PING kube = new KUBE_PING();
+                    kube.setValue("namespace", "default");
+                    kube.setValue("label_selector", "app=" + cfg.getServiceName());
+                    stack.addProtocol(kube);
+                    System.out.println("🤖 Auto-detected K8s → KUBE_PING");
+                } else {
                     configureDynamicTCPPing(stack, cfg, port);
-                    System.out.println("📡 Using TCPPING for static/dynamic VM discovery");
-                }
-                default -> {  // auto
-                    if (isKubernetes()) {
-                        stack.addProtocol(new KUBE_PING().setLabel("app", cfg.getServiceName()));
-                        System.out.println("🤖 Auto: Detected K8s → KUBE_PING enabled");
-                    } else if (Files.exists(Path.of("/nomad"))) {
-                        stack.addProtocol(new DNS_PING().setDnsServiceName(cfg.getServiceName()));
-                        System.out.println("🤖 Auto: Detected Nomad → DNS_PING enabled");
-                    } else {
-                        configureDynamicTCPPing(stack, cfg, port);
-                        System.out.println("🤖 Auto: Detected VM → dynamic TCPPING enabled");
-                    }
+                    System.out.println("🤖 Auto-detected VM/Nomad → TCPPING");
                 }
             }
-        } catch (Exception e) {
-            throw new RuntimeException("❌ Discovery configuration failed: " + e.getMessage(), e);
         }
+    } catch (Exception e) {
+        throw new RuntimeException("❌ Discovery configuration failed: " + e.getMessage(), e);
     }
+}
+
 
     private void configureDynamicTCPPing(ProtocolStack stack, RaftConfig cfg, int port) throws IOException {
         List<String> members = DynamicRaftRegistry.registerAndGetMembers(cfg.getBindAddress(), port);
