@@ -1,0 +1,81 @@
+package com.example.jgroups.debug;
+
+import org.jgroups.JChannel;
+import org.jgroups.stack.Protocol;
+import org.jgroups.stack.ProtocolStack;
+import org.jgroups.protocols.TP;
+
+public class JGroupsInitVerifier {
+
+    /**
+     * Builds, initializes, and verifies a given JGroups channel.
+     * Prints detailed diagnostics if any protocol fails before TP.init().
+     */
+    public static void verifyStack(ProtocolStack stack) {
+        System.out.println("🔍 Verifying JGroups protocol stack...");
+        int index = 1;
+        for (Protocol p : stack.getProtocols()) {
+            System.out.printf("%02d. %s%n", index++, p.getClass().getSimpleName());
+        }
+        System.out.println("--------------------------------------------");
+
+        try {
+            stack.init(); // manually initialize all protocols
+
+            TP tp = stack.getTransport();
+            if (tp == null) {
+                System.err.println("❌ No transport protocol found!");
+                return;
+            }
+
+            System.out.println("✅ Transport: " + tp.getClass().getSimpleName());
+            if (tp.getBundler() != null) {
+                System.out.println("✅ Bundler initialized: " + tp.getBundler().getClass().getSimpleName());
+            } else {
+                System.err.println("⚠️ Bundler is null! Transport may have failed to init completely.");
+            }
+
+        } catch (Throwable e) {
+            System.err.println("💥 Exception during stack.init(): " + e.getClass().getSimpleName() + " → " + e.getMessage());
+            e.printStackTrace(System.err);
+
+            // Find which protocol failed to initialize
+            System.err.println("🔎 Checking which protocol may have caused init failure...");
+            for (Protocol p : stack.getProtocols()) {
+                try {
+                    p.init();
+                } catch (Throwable ex) {
+                    System.err.println("❌ Failed initializing: " + p.getClass().getSimpleName() +
+                            " → " + ex.getMessage());
+                    break;
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        JChannel ch = new JChannel(false);
+        ProtocolStack stack = new ProtocolStack();
+        ch.setProtocolStack(stack);
+
+        // Example minimal TCP + DNS_PING stack for VM
+        stack.addProtocol(new org.jgroups.protocols.TCP().setBindPort(0))
+             .addProtocol(new org.jgroups.protocols.dns.DNS_PING()
+                 .setDnsQuery("dds-stats.internal")
+                 .setTimeout(3000))
+             .addProtocol(new org.jgroups.protocols.MERGE3())
+             .addProtocol(new org.jgroups.protocols.FD_SOCK())
+             .addProtocol(new org.jgroups.protocols.FD_ALL())
+             .addProtocol(new org.jgroups.protocols.VERIFY_SUSPECT())
+             .addProtocol(new org.jgroups.protocols.BARRIER())
+             .addProtocol(new org.jgroups.protocols.NAKACK2())
+             .addProtocol(new org.jgroups.protocols.UNICAST3())
+             .addProtocol(new org.jgroups.protocols.STABLE())
+             .addProtocol(new org.jgroups.protocols.UFC())
+             .addProtocol(new org.jgroups.protocols.MFC())
+             .addProtocol(new org.jgroups.protocols.GMS())
+             .addProtocol(new org.jgroups.protocols.FRAG2());
+
+        verifyStack(stack);
+    }
+}
