@@ -1,0 +1,34 @@
+
+import com.example.dds.config.*;
+import com.example.dds.raft.*;
+import com.example.dds.util.DnsHealthCheck;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.*;
+
+@Configuration
+@ConditionalOnProperty(prefix = "dds.stats", name = "enable", havingValue = "true")
+public class DdsStatsAutoConfiguration {
+
+    @Bean
+    public DnsHealthCheck dnsHealthCheck(DdsStatsProperties props) {
+        return new DnsHealthCheck(props.getRaft().getDnsService());
+    }
+
+    @Bean
+    public ReplicatedCache replicatedCache(DdsStatsProperties props,
+                                           MeterRegistry registry) throws Exception {
+        var raftCfg = props.getRaft();
+        var node = new ReplicatedCacheNode(
+                raftCfg.getClusterName(),
+                raftCfg.getBindAddress(),
+                raftCfg.getBindPort(),
+                raftCfg.getRaftId(),
+                raftCfg.getDnsService(),
+                raftCfg.getMembers(),
+                new java.util.concurrent.ConcurrentHashMap<>(),
+                registry
+        );
+        return new ReplicatedCache(node);
+    }
+}
