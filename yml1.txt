@@ -1,0 +1,10 @@
+dds:
+  stats:
+    enable: true
+    raft:
+      clusterName: dds-raft-cluster
+      bindAddress: auto
+      bindPort: 0
+      raftId: auto
+      dnsService: dds-raft.internal
+      # members: []   # optional for DNS_PING, static host:port for TCPPING
