@@ -1,0 +1,25 @@
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Simple in-memory node registry.
+ * Replaceable by Redis / DB / Hazelcast map for distributed discovery.
+ */
+public class DynamicRaftRegistry {
+
+    private static final Map<String, String> nodes = new ConcurrentHashMap<>();
+
+    public static synchronized void register(String raftId, String addressPort) {
+        nodes.put(raftId, addressPort);
+        System.out.printf("🧭 Registered node %s at %s%n", raftId, addressPort);
+    }
+
+    public static synchronized List<String> listMembers() {
+        return new ArrayList<>(nodes.values());
+    }
+
+    public static void printMembers() {
+        System.out.println("📜 Known members: " + String.join(", ", nodes.values()));
+    }
+}
