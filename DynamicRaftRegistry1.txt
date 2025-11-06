@@ -1,0 +1,28 @@
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * In-memory registry for dynamically discovered RAFT nodes.
+ * Replaceable by Redis, DB, or Hazelcast IMap in production.
+ */
+public class DynamicRaftRegistry {
+
+    private static final Map<String, String> nodes = new ConcurrentHashMap<>();
+
+    /** Register this node in the shared registry. */
+    public static synchronized void register(String raftId, String addressPort) {
+        nodes.put(raftId, addressPort);
+        System.out.printf("🧭 Registered node %s at %s%n", raftId, addressPort);
+    }
+
+    /** Return the list of all known RAFT members. */
+    public static synchronized List<String> listMembers() {
+        return new ArrayList<>(nodes.values());
+    }
+
+    /** Debug printout of all known nodes. */
+    public static void printMembers() {
+        System.out.println("📜 Known members: " + String.join(", ", nodes.values()));
+    }
+}
