@@ -1,0 +1,180 @@
+
+import io.micrometer.core.instrument.*;
+import org.jgroups.*;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.raft.RAFT;
+import org.jgroups.raft.RaftHandle;
+import org.jgroups.raft.StateMachine;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * RAFT-replicated cache node with dynamic registry discovery.
+ * Works with random ports (bindPort=0) and auto hostname detection.
+ * Designed for VM / Nomad / Docker environments without DNS.
+ */
+public class ReplicatedCacheNode implements StateMachine {
+
+    private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
+    private final MeterRegistry registry;
+    private final RaftHandle raft;
+
+    public ReplicatedCacheNode(String clusterName,
+                               String bindAddress,
+                               int bindPort,
+                               String raftId,
+                               MeterRegistry registry) throws Exception {
+
+        this.registry = registry;
+
+        // 🌐 Resolve a real, non-loopback IP
+        InetAddress bind = "auto".equalsIgnoreCase(bindAddress)
+                ? getRealLocalHost()
+                : InetAddress.getByName(bindAddress);
+
+        String realHost = bind.getHostAddress(); // routable IP
+        System.out.printf("🌐 Bind address resolved to %s (%s)%n",
+                bind.getHostName(), realHost);
+
+        // TCP transport
+        TCP tcp = new TCP().setBindAddress(bind).setBindPort(bindPort);
+
+        // Placeholder discovery; dynamic members added later
+        TCPPING tcpPing = new TCPPING();
+
+        // RAFT protocol
+        RAFT raftProtocol = new RAFT().setStateMachine(this);
+
+        // Build protocol stack
+        JChannel channel = new JChannel(
+                tcp,
+                tcpPing,
+                raftProtocol,
+                new FD_SOCK(),
+                new FD_ALL(),
+                new VERIFY_SUSPECT(),
+                new BARRIER(),
+                new NAKACK2(),
+                new UNICAST3(),
+                new STABLE(),
+                new GMS(),
+                new FRAG2()
+        );
+
+        channel.connect(clusterName);
+
+        // Get actual port (random if bindPort=0)
+        TCP transport = (TCP) channel.getProtocolStack().getTransport();
+        int actualPort = transport.getBindPort();
+
+        // ✅ RAFT ID must use realHost (never localhost)
+        String finalRaftId = "auto".equalsIgnoreCase(raftId)
+                ? realHost + ":" + actualPort
+                : raftId;
+
+        // Create RAFT handle
+        this.raft = new RaftHandle(channel, raftProtocol).raftId(finalRaftId);
+
+        // Dynamic registration
+        DynamicRaftRegistry.register(finalRaftId, finalRaftId);
+        List<String> members = DynamicRaftRegistry.listMembers();
+        raftProtocol.setMembers(resolveRaftMembers(members));
+
+        System.out.printf("✅ Node [%s] joined cluster '%s' at %s:%d%n",
+                finalRaftId, clusterName, realHost, actualPort);
+        DynamicRaftRegistry.printMembers();
+
+        bindMetrics();
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Public API
+    // ---------------------------------------------------------------------
+
+    /** Replicated put — persisted through RAFT log. */
+    public void put(String key, String value) throws Exception {
+        try (var bout = new ByteArrayOutputStream();
+             var out = new DataOutputStream(bout)) {
+            out.writeUTF(key);
+            out.writeUTF(value == null ? "" : value);
+            raft.setAsync(bout.toByteArray());
+        }
+    }
+
+    /** Local read (eventually consistent). */
+    public String get(String key) {
+        return cache.get(key);
+    }
+
+    /** Snapshot view of cache. */
+    public Map<String, String> snapshot() {
+        return Map.copyOf(cache);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 RAFT StateMachine callbacks
+    // ---------------------------------------------------------------------
+
+    @Override
+    public void apply(byte[] data, int offset, int length, boolean serialize) throws Exception {
+        try (var dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
+            String key = dis.readUTF();
+            String value = dis.readUTF();
+            cache.put(key, value);
+            System.out.printf("📣 [RAFT] applied: %s=%s%n", key, value);
+        }
+    }
+
+    @Override public void readContentFrom(DataInput in) {}
+    @Override public void writeContentTo(DataOutput out) {}
+
+    // ---------------------------------------------------------------------
+    // 🧩 Metrics
+    // ---------------------------------------------------------------------
+
+    private void bindMetrics() {
+        Gauge.builder("dds_cache_size", cache, Map::size)
+                .description("Number of replicated entries in DDS cache")
+                .register(registry);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Helpers
+    // ---------------------------------------------------------------------
+
+    private List<String> resolveRaftMembers(List<String> members) {
+        return members.stream()
+                .map(m -> m.contains(":") ? m.substring(0, m.indexOf(':')) : m)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Returns a non-loopback, routable IP for this host.
+     */
+    private static InetAddress getRealLocalHost() throws UnknownHostException {
+        try {
+            InetAddress candidate = InetAddress.getLocalHost();
+            if (!candidate.isLoopbackAddress() && !candidate.getHostAddress().startsWith("127"))
+                return candidate;
+
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (iface.isUp() && !iface.isLoopback()) {
+                    Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (addr instanceof Inet4Address && !addr.isLoopbackAddress())
+                            return addr;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return InetAddress.getLocalHost(); // fallback
+    }
+}
