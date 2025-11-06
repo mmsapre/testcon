@@ -1,0 +1,181 @@
+
+import io.micrometer.core.instrument.*;
+import org.jgroups.*;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.raft.RAFT;
+import org.jgroups.raft.RaftHandle;
+import org.jgroups.raft.StateMachine;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * RAFT-replicated in-memory cache using JGroups 5.5 + jgroups-raft 1.0.6.
+ * Works in VMs, bare-metal, Docker, Nomad (no DNS dependency).
+ */
+public class ReplicatedCacheNode implements StateMachine {
+
+    private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
+    private final MeterRegistry registry;
+    private final RaftHandle raft;
+
+    public ReplicatedCacheNode(String clusterName,
+                               String bindAddress,
+                               int bindPort,
+                               String raftId,
+                               List<String> members,
+                               MeterRegistry registry) throws Exception {
+
+        this.registry = registry;
+
+        // 🌐 Resolve proper bind address (not localhost)
+        InetAddress bind = "auto".equalsIgnoreCase(bindAddress)
+                ? getRealLocalHost()
+                : InetAddress.getByName(bindAddress);
+
+        System.out.printf("🌐 Bind address resolved to %s (%s)%n",
+                bind.getHostName(), bind.getHostAddress());
+
+        // TCP transport
+        TCP tcp = new TCP().setBindAddress(bind).setBindPort(bindPort);
+
+        // Static TCPPING membership
+        if (members == null || members.isEmpty())
+            throw new IllegalArgumentException("TCPPING requires non-empty members list");
+
+        List<InetSocketAddress> hosts = members.stream()
+                .map(m -> {
+                    String[] parts = m.split(":");
+                    String host = parts[0];
+                    int port = parts.length > 1 ? Integer.parseInt(parts[1]) : bindPort;
+                    return new InetSocketAddress(host, port);
+                })
+                .toList();
+
+        TCPPING tcpPing = new TCPPING().setInitialHosts(hosts);
+
+        // RAFT protocol
+        RAFT raftProtocol = new RAFT()
+                .setMembers(resolveRaftMembers(members))
+                .setStateMachine(this);
+
+        // Build channel stack
+        JChannel channel = new JChannel(
+                tcp,
+                tcpPing,
+                raftProtocol,
+                new FD_SOCK(),
+                new FD_ALL(),
+                new VERIFY_SUSPECT(),
+                new BARRIER(),
+                new NAKACK2(),
+                new UNICAST3(),
+                new STABLE(),
+                new GMS(),
+                new FRAG2()
+        );
+
+        channel.connect(clusterName);
+
+        TCP transport = (TCP) channel.getProtocolStack().getTransport();
+        String finalRaftId = "auto".equalsIgnoreCase(raftId)
+                ? bind.getHostName() + ":" + transport.getBindPort()
+                : raftId;
+
+        this.raft = new RaftHandle(channel, raftProtocol).raftId(finalRaftId);
+
+        System.out.printf("✅ Node [%s] joined cluster '%s' (%s:%d)%n",
+                finalRaftId, clusterName, bind.getHostName(), transport.getBindPort());
+
+        bindMetrics();
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Public cache API
+    // ---------------------------------------------------------------------
+
+    /** Replicated put (through RAFT log) */
+    public void put(String key, String value) throws Exception {
+        try (var bout = new ByteArrayOutputStream();
+             var out = new DataOutputStream(bout)) {
+            out.writeUTF(key);
+            out.writeUTF(value == null ? "" : value);
+            raft.setAsync(bout.toByteArray());
+        }
+    }
+
+    /** Local get (eventual consistency) */
+    public String get(String key) {
+        return cache.get(key);
+    }
+
+    /** Local snapshot */
+    public Map<String, String> snapshot() {
+        return Map.copyOf(cache);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 RAFT StateMachine callbacks
+    // ---------------------------------------------------------------------
+    @Override
+    public void apply(byte[] data, int offset, int length, boolean serialize) throws Exception {
+        try (var dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
+            String key = dis.readUTF();
+            String value = dis.readUTF();
+            cache.put(key, value);
+            System.out.printf("📣 [RAFT] applied: %s=%s%n", key, value);
+        }
+    }
+
+    @Override public void readContentFrom(DataInput in) {}
+    @Override public void writeContentTo(DataOutput out) {}
+
+    // ---------------------------------------------------------------------
+    // 🧩 Metrics binding
+    // ---------------------------------------------------------------------
+    private void bindMetrics() {
+        Gauge.builder("dds_cache_size", cache, Map::size)
+                .description("Number of replicated entries in DDS cache")
+                .register(registry);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Helpers
+    // ---------------------------------------------------------------------
+    private List<String> resolveRaftMembers(List<String> members) {
+        return members.stream()
+                .map(m -> m.contains(":") ? m.substring(0, m.indexOf(':')) : m)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Returns non-loopback, routable address for the current host.
+     */
+    private static InetAddress getRealLocalHost() throws UnknownHostException {
+        try {
+            InetAddress candidate = InetAddress.getLocalHost();
+            if (!candidate.isLoopbackAddress() && !candidate.getHostAddress().startsWith("127")) {
+                return candidate;
+            }
+            // iterate over network interfaces to find a better address
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (iface.isUp() && !iface.isLoopback()) {
+                    Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                            return addr;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return InetAddress.getLocalHost(); // fallback
+    }
+}
