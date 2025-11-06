@@ -1,0 +1,238 @@
+
+import io.micrometer.core.instrument.*;
+import org.jgroups.*;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.raft.RAFT;
+import org.jgroups.raft.RaftHandle;
+import org.jgroups.raft.StateMachine;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * RAFT-based replicated cache with automatic leader detection and timed metric updates.
+ * Works with JGroups 5.5 and jgroups-raft 1.0.6.
+ */
+public class ReplicatedCacheNode implements StateMachine {
+
+    private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
+    private final MeterRegistry registry;
+    private RaftHandle raft;
+    private JChannel channel;
+    private String raftId;
+
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private final AtomicBoolean isLeader = new AtomicBoolean(false);
+
+    // ---------------------------------------------------------------------
+    // 🧩 Constructor
+    // ---------------------------------------------------------------------
+    public ReplicatedCacheNode(String clusterName,
+                               String bindAddress,
+                               int bindPort,
+                               String raftId,
+                               MeterRegistry registry) {
+        this.registry = registry;
+        try {
+            initChannel(clusterName, bindAddress, bindPort, raftId);
+            startLeaderMonitor();
+            startLeaderMetricsJob();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize RAFT node", e);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 JGroups + RAFT init
+    // ---------------------------------------------------------------------
+    private void initChannel(String clusterName, String bindAddress, int bindPort, String raftId) throws Exception {
+        InetAddress bind = "auto".equalsIgnoreCase(bindAddress)
+                ? getRealLocalHost()
+                : InetAddress.getByName(bindAddress);
+        String realHost = bind.getHostName();
+
+        System.out.printf("🌐 Binding to %s (%s)%n", bind.getHostName(), realHost);
+
+        TCP tcp = new TCP().setBindAddress(bind).setBindPort(bindPort);
+        TCPPING tcpPing = new TCPPING();
+        RAFT raftProtocol = new RAFT();
+
+        this.channel = new JChannel(
+                tcp,
+                tcpPing,
+                raftProtocol,
+                new FD_SOCK(),
+                new FD_ALL(),
+                new VERIFY_SUSPECT(),
+                new BARRIER(),
+                new NAKACK2(),
+                new UNICAST3(),
+                new STABLE(),
+                new GMS(),
+                new FRAG2()
+        );
+
+        channel.connect(clusterName);
+
+        TCP transport = (TCP) channel.getProtocolStack().getTransport();
+        int actualPort = transport.getBindPort();
+
+        this.raftId = "auto".equalsIgnoreCase(raftId)
+                ? realHost + ":" + actualPort
+                : raftId;
+
+        this.raft = new RaftHandle(channel, this).raftId(this.raftId);
+
+        DynamicRaftRegistry.register(this.raftId, this.raftId);
+        DynamicRaftRegistry.printMembers();
+
+        bindMetrics();
+
+        System.out.printf("✅ Node [%s] joined cluster '%s' at %s:%d%n",
+                this.raftId, clusterName, realHost, actualPort);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Leader monitor (poll-based)
+    // ---------------------------------------------------------------------
+    private void startLeaderMonitor() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            boolean currentlyLeader = raft.isLeader();
+            if (currentlyLeader && !isLeader.get()) {
+                isLeader.set(true);
+                System.out.printf("👑 [%s] is now leader%n", raftId);
+                try { syncMembers(); } catch (Exception e) {
+                    System.err.println("⚠️ Leader sync failed: " + e.getMessage());
+                }
+            } else if (!currentlyLeader && isLeader.get()) {
+                isLeader.set(false);
+                System.out.printf("🫡 [%s] stepped down%n", raftId);
+            }
+        }, 3, 5, TimeUnit.SECONDS);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Dynamic membership sync
+    // ---------------------------------------------------------------------
+    private void syncMembers() throws Exception {
+        RAFT raftProtocol = channel.getProtocolStack().findProtocol(RAFT.class);
+        if (raftProtocol == null) {
+            System.err.println("❌ RAFT protocol not found");
+            return;
+        }
+
+        List<String> members = DynamicRaftRegistry.listMembers();
+        for (String member : members) {
+            if (!member.equals(raft.raftId())) {
+                try {
+                    raftProtocol.addServer(member);
+                    System.out.printf("🔁 Added peer: %s%n", member);
+                } catch (Exception e) {
+                    String msg = e.getMessage() == null ? "" : e.getMessage();
+                    if (!msg.contains("exists")) {
+                        System.err.printf("⚠️ addServer(%s) failed: %s%n", member, msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Replication API
+    // ---------------------------------------------------------------------
+    public void put(String key, String value) throws Exception {
+        try (var bout = new ByteArrayOutputStream();
+             var out = new DataOutputStream(bout)) {
+            out.writeUTF(key);
+            out.writeUTF(value == null ? "" : value);
+            raft.setAsync(bout.toByteArray());   // replicated automatically
+        }
+    }
+
+    public String get(String key) { return cache.get(key); }
+
+    public Map<String, String> snapshot() { return Map.copyOf(cache); }
+
+    // ---------------------------------------------------------------------
+    // 🧩 StateMachine replication handler
+    // ---------------------------------------------------------------------
+    @Override
+    public void apply(byte[] data, int offset, int length, boolean serialize) throws Exception {
+        try (var dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
+            String key = dis.readUTF();
+            String value = dis.readUTF();
+            cache.put(key, value);
+            System.out.printf("📣 Applied %s=%s%n", key, value);
+        }
+    }
+
+    @Override public void readContentFrom(DataInput in) {}
+    @Override public void writeContentTo(DataOutput out) {}
+
+    // ---------------------------------------------------------------------
+    // 🧩 Leader-only periodic metric updater
+    // ---------------------------------------------------------------------
+    private void startLeaderMetricsJob() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            if (raft.isLeader()) {
+                try {
+                    // Simulate fetching metric from DB or external system
+                    double total = Math.round(Math.random() * 1000.0);
+                    put("metrics.total", String.valueOf(total));
+                    System.out.printf("📊 Leader updated metric.total=%s%n", total);
+                } catch (Exception e) {
+                    System.err.println("⚠️ Metrics update failed: " + e.getMessage());
+                }
+            }
+        }, 10, 60, TimeUnit.SECONDS); // every minute
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Micrometer metric
+    // ---------------------------------------------------------------------
+    private void bindMetrics() {
+        Gauge.builder("dds_cache_size", cache, Map::size)
+             .description("Number of entries in replicated DDS cache")
+             .register(registry);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Lifecycle helpers
+    // ---------------------------------------------------------------------
+    public boolean isLeader() { return isLeader.get(); }
+
+    public void shutdown() {
+        System.out.printf("🛑 Shutting down node [%s]%n", raftId);
+        scheduler.shutdownNow();
+        if (channel != null && channel.isConnected()) channel.close();
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Utility for real host detection
+    // ---------------------------------------------------------------------
+    private static InetAddress getRealLocalHost() throws UnknownHostException {
+        try {
+            InetAddress candidate = InetAddress.getLocalHost();
+            if (!candidate.isLoopbackAddress() && !candidate.getHostAddress().startsWith("127"))
+                return candidate;
+
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (iface.isUp() && !iface.isLoopback()) {
+                    Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (addr instanceof Inet4Address && !addr.isLoopbackAddress())
+                            return addr;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return InetAddress.getLocalHost();
+    }
+}
