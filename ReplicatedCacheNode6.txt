@@ -1,0 +1,228 @@
+;
+
+import io.micrometer.core.instrument.*;
+import org.jgroups.*;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.raft.RAFT;
+import org.jgroups.raft.RaftHandle;
+import org.jgroups.raft.StateMachine;
+
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Replicated DDS cache using JGroups RAFT (1.0.6)
+ * Works with dynamic ports and hostnames on VM / K8s / Nomad.
+ */
+public class ReplicatedCacheNode implements StateMachine {
+
+    private final ConcurrentHashMap<String, String> cache = new ConcurrentHashMap<>();
+    private final MeterRegistry registry;
+    private RaftHandle raft;
+    private JChannel channel;
+    private String raftId;
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicBoolean isLeader = new AtomicBoolean(false);
+
+    public ReplicatedCacheNode(String clusterName,
+                               String bindAddress,
+                               int bindPort,
+                               String raftId,
+                               MeterRegistry registry) {
+        this.registry = registry;
+
+        try {
+            initChannel(clusterName, bindAddress, bindPort, raftId);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to initialize RAFT node", e);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Initialization
+    // ---------------------------------------------------------------------
+    private void initChannel(String clusterName, String bindAddress, int bindPort, String raftId) throws Exception {
+        InetAddress bind = "auto".equalsIgnoreCase(bindAddress)
+                ? getRealLocalHost()
+                : InetAddress.getByName(bindAddress);
+        String realHost = bind.getHostAddress();
+
+        System.out.printf("🌐 Binding to %s (%s)%n", bind.getHostName(), realHost);
+
+        // Protocol stack (TCP-based)
+        TCP tcp = new TCP().setBindAddress(bind).setBindPort(bindPort);
+        TCPPING tcpPing = new TCPPING();
+        RAFT raftProtocol = new RAFT();
+
+        this.channel = new JChannel(
+                tcp,
+                tcpPing,
+                raftProtocol,
+                new FD_SOCK(),
+                new FD_ALL(),
+                new VERIFY_SUSPECT(),
+                new BARRIER(),
+                new NAKACK2(),
+                new UNICAST3(),
+                new STABLE(),
+                new GMS(),
+                new FRAG2()
+        );
+
+        channel.connect(clusterName);
+
+        TCP transport = (TCP) channel.getProtocolStack().getTransport();
+        int actualPort = transport.getBindPort();
+
+        this.raftId = "auto".equalsIgnoreCase(raftId)
+                ? bind.getHostName() + ":" + actualPort
+                : raftId;
+
+        this.raft = new RaftHandle(channel, this).raftId(this.raftId);
+
+        DynamicRaftRegistry.register(this.raftId, this.raftId);
+        DynamicRaftRegistry.printMembers();
+
+        setupRoleListener();
+        bindMetrics();
+
+        System.out.printf("✅ Node [%s] joined cluster '%s' on %s:%d%n",
+                this.raftId, clusterName, realHost, actualPort);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Role change handling
+    // ---------------------------------------------------------------------
+    private void setupRoleListener() {
+        raft.addRoleListener((oldRole, newRole) -> {
+            if (newRole == RaftHandle.Role.Leader) {
+                isLeader.set(true);
+                System.out.printf("👑 [%s] became leader%n", raftId);
+                onLeaderElected();
+            } else {
+                isLeader.set(false);
+                System.out.printf("🫡 [%s] stepped down (role=%s)%n", raftId, newRole);
+            }
+        });
+    }
+
+    private void onLeaderElected() {
+        scheduler.schedule(() -> {
+            try {
+                syncMembers();
+            } catch (Exception e) {
+                System.err.println("⚠️ Leader sync failed: " + e.getMessage());
+            }
+        }, 3, TimeUnit.SECONDS); // small delay to let cluster stabilize
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Membership management
+    // ---------------------------------------------------------------------
+    private void syncMembers() throws Exception {
+        RAFT raftProtocol = channel.getProtocolStack().findProtocol(RAFT.class);
+        if (raftProtocol == null) {
+            System.err.println("❌ RAFT protocol not found in stack");
+            return;
+        }
+
+        List<String> members = DynamicRaftRegistry.listMembers();
+        for (String member : members) {
+            if (!member.equals(raft.raftId())) {
+                try {
+                    raftProtocol.addServer(member);
+                    System.out.printf("🔁 Leader added member: %s%n", member);
+                } catch (Exception e) {
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
+                    if (!msg.contains("exists")) {
+                        System.err.printf("⚠️ Could not add member %s: %s%n", member, msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Cache operations
+    // ---------------------------------------------------------------------
+    public void put(String key, String value) throws Exception {
+        try (var bout = new ByteArrayOutputStream();
+             var out = new DataOutputStream(bout)) {
+            out.writeUTF(key);
+            out.writeUTF(value == null ? "" : value);
+            raft.setAsync(bout.toByteArray());
+        }
+    }
+
+    public String get(String key) {
+        return cache.get(key);
+    }
+
+    public Map<String, String> snapshot() {
+        return Map.copyOf(cache);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 StateMachine (applied on all nodes)
+    // ---------------------------------------------------------------------
+    @Override
+    public void apply(byte[] data, int offset, int length, boolean serialize) throws Exception {
+        try (var dis = new DataInputStream(new ByteArrayInputStream(data, offset, length))) {
+            String key = dis.readUTF();
+            String value = dis.readUTF();
+            cache.put(key, value);
+            System.out.printf("📣 [RAFT] applied: %s=%s%n", key, value);
+        }
+    }
+
+    @Override public void readContentFrom(DataInput in) {}
+    @Override public void writeContentTo(DataOutput out) {}
+
+    // ---------------------------------------------------------------------
+    // 🧩 Metrics
+    // ---------------------------------------------------------------------
+    private void bindMetrics() {
+        Gauge.builder("dds_cache_size", cache, Map::size)
+                .description("Number of replicated entries in DDS cache")
+                .register(registry);
+    }
+
+    // ---------------------------------------------------------------------
+    // 🧩 Utility + Lifecycle
+    // ---------------------------------------------------------------------
+    public boolean isLeader() {
+        return isLeader.get();
+    }
+
+    public void shutdown() {
+        System.out.printf("🛑 Shutting down node [%s]%n", raftId);
+        scheduler.shutdownNow();
+        if (channel != null && channel.isConnected()) channel.close();
+    }
+
+    private static InetAddress getRealLocalHost() throws UnknownHostException {
+        try {
+            InetAddress candidate = InetAddress.getLocalHost();
+            if (!candidate.isLoopbackAddress() && !candidate.getHostAddress().startsWith("127"))
+                return candidate;
+
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (iface.isUp() && !iface.isLoopback()) {
+                    Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress addr = addrs.nextElement();
+                        if (addr instanceof Inet4Address && !addr.isLoopbackAddress())
+                            return addr;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return InetAddress.getLocalHost();
+    }
+}
