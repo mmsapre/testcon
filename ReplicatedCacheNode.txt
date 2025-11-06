@@ -1,0 +1,112 @@
+package com.example.dds.raft;
+
+import io.micrometer.core.instrument.*;
+import org.jgroups.*;
+import org.jgroups.protocols.*;
+import org.jgroups.protocols.pbcast.*;
+import org.jgroups.protocols.raft.RAFT;
+import org.jgroups.raft.RaftHandle;
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+public class ReplicatedCacheNode {
+    private final RaftHandle raft;
+    private final ConcurrentHashMap<String, Double> cache;
+    private final MeterRegistry registry;
+
+    public ReplicatedCacheNode(String clusterName,
+                               String bindAddress,
+                               int bindPort,
+                               String raftId,
+                               String dnsService,
+                               List<String> members,
+                               ConcurrentHashMap<String, Double> cache,
+                               MeterRegistry registry) throws Exception {
+
+        this.cache = cache;
+        this.registry = registry;
+
+        InetAddress bind = "auto".equalsIgnoreCase(bindAddress)
+                ? InetAddress.getLocalHost()
+                : InetAddress.getByName(bindAddress);
+
+        TCP tcp = new TCP().setBindAddress(bind).setBindPort(bindPort);
+
+        Protocol discovery;
+        if (members != null && !members.isEmpty()) {
+            System.out.println("🔍 Using TCPPING with configured members");
+            List<InetSocketAddress> hosts = new ArrayList<>();
+            for (String entry : members) {
+                String[] parts = entry.split(":");
+                String host = parts[0];
+                int port = parts.length > 1 ? Integer.parseInt(parts[1]) : 7800;
+                hosts.add(new InetSocketAddress(host, port));
+            }
+            discovery = new TCPPING().setInitialHosts(hosts);
+        } else {
+            System.out.println("🔍 Using DNS_PING with query: " + dnsService);
+            discovery = new DNS_PING().setDnsQuery(dnsService);
+        }
+
+        RAFT raftProtocol = new RAFT()
+                .setMembers(resolveRaftMembers(members))
+                .setStateMachine(new RaftStateMachine(cache));
+
+        JChannel channel = new JChannel(
+                tcp,
+                discovery,
+                raftProtocol,
+                new FD_SOCK(), new FD_ALL(),
+                new VERIFY_SUSPECT(), new BARRIER(),
+                new NAKACK2(), new UNICAST3(),
+                new STABLE(), new GMS(), new FRAG2()
+        );
+
+        channel.connect(clusterName);
+
+        TCP transport = (TCP) channel.getProtocolStack().getTransport();
+        String finalRaftId = "auto".equalsIgnoreCase(raftId)
+                ? bind.getHostName() + ":" + transport.getBindPort()
+                : raftId;
+
+        this.raft = new RaftHandle(channel, raftProtocol).raftId(finalRaftId);
+
+        System.out.printf("✅ [%s] joined cluster '%s' on %s:%d (%s)%n",
+                finalRaftId, clusterName, bind.getHostName(), transport.getBindPort(),
+                (members != null && !members.isEmpty()) ? "TCPPING" : "DNS_PING");
+
+        bindMetrics();
+    }
+
+    public void replicate(String key, double value) throws Exception {
+        try (ByteArrayOutputStream bout = new ByteArrayOutputStream();
+             DataOutputStream out = new DataOutputStream(bout)) {
+            out.writeUTF(key);
+            out.writeDouble(value);
+            raft.setAsync(bout.toByteArray());
+        }
+    }
+
+    private void bindMetrics() {
+        cache.forEach((key, value) ->
+                Gauge.builder("dds_replicated_stats", cache, m -> m.getOrDefault(key, 0.0))
+                        .tag("key", key)
+                        .register(registry));
+    }
+
+    private List<String> resolveRaftMembers(List<String> members) {
+        if (members == null || members.isEmpty()) {
+            try {
+                return Collections.singletonList(InetAddress.getLocalHost().getHostName());
+            } catch (Exception e) {
+                return List.of("unknown");
+            }
+        }
+        return members.stream()
+                .map(m -> m.contains(":") ? m.substring(0, m.indexOf(':')) : m)
+                .collect(Collectors.toList());
+    }
+}
