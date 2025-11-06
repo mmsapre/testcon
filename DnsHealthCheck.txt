@@ -1,0 +1,25 @@
+
+import javax.annotation.PostConstruct;
+import java.net.InetAddress;
+import java.util.Arrays;
+
+public class DnsHealthCheck {
+    private final String dnsService;
+
+    public DnsHealthCheck(String dnsService) {
+        this.dnsService = dnsService;
+    }
+
+    @PostConstruct
+    public void verifyDns() throws Exception {
+        System.out.printf("🔍 Checking DNS for '%s'...%n", dnsService);
+        InetAddress[] results = InetAddress.getAllByName(dnsService);
+        if (results.length == 0) {
+            throw new IllegalStateException("❌ No DNS records found for " + dnsService);
+        }
+        System.out.printf("✅ DNS '%s' resolved to: %s%n",
+                dnsService,
+                Arrays.toString(Arrays.stream(results)
+                        .map(InetAddress::getHostAddress).toArray()));
+    }
+}
