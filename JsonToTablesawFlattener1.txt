@@ -165,11 +165,30 @@ public class JsonToTablesawFlattener {
         }
 
         if (forceString) return StringColumn.create(name, stringVals);
-        if (allInt) return IntColumn.create(name, intVals);
-        if (allDouble) return DoubleColumn.create(name, doubleVals);
-        if (allBool) return BooleanColumn.create(name, boolVals);
+        if (allInt) return IntColumn.create(name, toIntArray(intVals));
+        if (allDouble) return DoubleColumn.create(name, toDoubleArray(doubleVals));
+        if (allBool) return BooleanColumn.create(name, toBooleanArray(boolVals));
         if (allDate) return DateColumn.create(name, dateVals);
         return StringColumn.create(name, stringVals);
+    }
+
+    // -----------------------------------------------------------
+    // Helpers to convert boxed lists -> primitive arrays
+    // -----------------------------------------------------------
+    private int[] toIntArray(List<Integer> list) {
+        return list.stream().filter(Objects::nonNull).mapToInt(Integer::intValue).toArray();
+    }
+
+    private double[] toDoubleArray(List<Double> list) {
+        return list.stream().filter(Objects::nonNull).mapToDouble(Double::doubleValue).toArray();
+    }
+
+    private boolean[] toBooleanArray(List<Boolean> list) {
+        boolean[] arr = new boolean[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            arr[i] = list.get(i) != null && list.get(i);
+        }
+        return arr;
     }
 
     public void exportToCsv(Map<String, Table> tables, String outputDir) throws IOException {
