@@ -1,0 +1,193 @@
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import tech.tablesaw.api.*;
+
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+
+public class JsonToTablesawFlattener {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final Map<String, List<Map<String, Object>>> rawTables = new HashMap<>();
+    private int idCounter = 1;
+
+    public Map<String, Table> flattenJson(String json) throws IOException {
+        JsonNode root = mapper.readTree(json);
+        if (root.isArray()) {
+            for (JsonNode node : root) {
+                flatten("root", node, null);
+            }
+        } else {
+            flatten("root", root, null);
+        }
+
+        Map<String, Table> tables = new HashMap<>();
+        for (Map.Entry<String, List<Map<String, Object>>> entry : rawTables.entrySet()) {
+            tables.put(entry.getKey(), toTable(entry.getKey(), entry.getValue()));
+        }
+        return tables;
+    }
+
+    private void flatten(String table, JsonNode node, String parentId) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        String currentId = "id_" + (idCounter++);
+
+        if (parentId != null) row.put("parent_id", parentId);
+        row.put("id", currentId);
+
+        Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            String key = field.getKey();
+            JsonNode value = field.getValue();
+
+            if (value.isValueNode()) {
+                row.put(key, value.asText());
+            } else if (value.isObject()) {
+                flatten(table + "_" + key, value, currentId);
+            } else if (value.isArray()) {
+                for (JsonNode item : value) {
+                    if (item.isValueNode()) {
+                        Map<String, Object> arrayRow = new HashMap<>();
+                        arrayRow.put("value", item.asText());
+                        arrayRow.put("parent_id", currentId);
+                        arrayRow.put("sourcePath", table + "." + key);
+                        add(table + "_" + key, arrayRow);
+                    } else {
+                        flatten(table + "_" + key, item, currentId);
+                    }
+                }
+            }
+        }
+
+        row.put("sourcePath", table);
+        add(table, row);
+    }
+
+    private void add(String table, Map<String, Object> row) {
+        rawTables.computeIfAbsent(table, t -> new ArrayList<>()).add(row);
+    }
+
+    private Table toTable(String name, List<Map<String, Object>> rows) {
+        Map<String, List<Object>> columns = new LinkedHashMap<>();
+        for (String key : rows.get(0).keySet()) {
+            columns.put(key, new ArrayList<>());
+        }
+
+        for (Map<String, Object> row : rows) {
+            for (String key : columns.keySet()) {
+                columns.get(key).add(row.getOrDefault(key, null));
+            }
+        }
+
+        Table table = Table.create(name);
+        for (Map.Entry<String, List<Object>> entry : columns.entrySet()) {
+            String colName = entry.getKey();
+            List<Object> values = entry.getValue();
+            Column<?> col = inferColumn(colName, values);
+            table.addColumns(col);
+        }
+
+        return table;
+    }
+
+    // -----------------------------------------------------------
+    // Enhanced inference: keeps identifiers and zero-padded numbers as strings
+    // -----------------------------------------------------------
+    private Column<?> inferColumn(String name, List<Object> values) {
+        boolean allInt = true, allDouble = true, allBool = true, allDate = true;
+        List<String> stringVals = new ArrayList<>();
+        List<Integer> intVals = new ArrayList<>();
+        List<Double> doubleVals = new ArrayList<>();
+        List<Boolean> boolVals = new ArrayList<>();
+        List<LocalDate> dateVals = new ArrayList<>();
+
+        boolean forceString = false;
+
+        for (Object o : values) {
+            String v = o == null ? "" : o.toString().trim();
+            stringVals.add(v);
+
+            if (v.isEmpty()) {
+                intVals.add(null);
+                doubleVals.add(null);
+                boolVals.add(null);
+                dateVals.add(null);
+                continue;
+            }
+
+            // ---------- Heuristics ----------
+            if (v.matches(".*[A-Za-z\\-_/].*")) {        // contains letters or special characters
+                forceString = true;
+            } else if (v.matches("^0\\d+$")) {           // leading zeros
+                forceString = true;
+            } else if (v.matches("^\\d{12,}$")) {        // long numeric sequence (like account numbers)
+                forceString = true;
+            } else if (name.matches("(?i).*(id|code|num|key|ref|zip).*")) { // field name hints
+                forceString = true;
+            } else if (v.matches(".*[eE].*")) {          // exponential notation
+                forceString = true;
+            }
+
+            try {
+                intVals.add(Integer.parseInt(v));
+            } catch (Exception e) {
+                allInt = false;
+                intVals.add(null);
+            }
+
+            try {
+                doubleVals.add(Double.parseDouble(v));
+            } catch (Exception e) {
+                allDouble = false;
+                doubleVals.add(null);
+            }
+
+            try {
+                boolVals.add(Boolean.parseBoolean(v));
+            } catch (Exception e) {
+                allBool = false;
+                boolVals.add(null);
+            }
+
+            try {
+                dateVals.add(LocalDate.parse(v));
+            } catch (DateTimeParseException e) {
+                allDate = false;
+                dateVals.add(null);
+            }
+        }
+
+        if (forceString) return StringColumn.create(name, stringVals);
+        if (allInt) return IntColumn.create(name, intVals);
+        if (allDouble) return DoubleColumn.create(name, doubleVals);
+        if (allBool) return BooleanColumn.create(name, boolVals);
+        if (allDate) return DateColumn.create(name, dateVals);
+        return StringColumn.create(name, stringVals);
+    }
+
+    public void exportToCsv(Map<String, Table> tables, String outputDir) throws IOException {
+        Files.createDirectories(Paths.get(outputDir));
+        for (Map.Entry<String, Table> entry : tables.entrySet()) {
+            entry.getValue().write().csv(Paths.get(outputDir, entry.getKey() + ".csv").toString());
+        }
+    }
+
+    public void exportToDatabase(Map<String, Table> tables, DataSource dataSource) {
+        try (Connection conn = dataSource.getConnection()) {
+            for (Map.Entry<String, Table> entry : tables.entrySet()) {
+                String tableName = entry.getKey();
+                Table table = entry.getValue();
+                table.write().db(conn, tableName);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("DB export failed", e);
+        }
+    }
+}
